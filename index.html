@@ -1,0 +1,346 @@
+<!DOCTYPE HTML>
+<html>
+  <head>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <style>
+      .loading {
+        text-align: center;
+      }
+
+      .group-header {
+        font-size: large;
+        border-bottom: solid thin;
+        width: 100%;
+        margin-top: 1em;
+        margin-bottom: 0.5em;
+        display: block;
+        cursor: pointer;
+        clear: both;
+      }
+
+      .group-date {
+        float: right;
+      }
+
+      .thread-header {
+        margin-top: 1em;
+        display: block;
+        cursor: pointer;
+        clear: both;
+      }
+
+      .thread-date {
+        float: right;
+      }
+
+      .message {
+        width: 100%;
+      }
+
+      .message.me {
+        background-color: rgb(240, 240, 240);
+      }
+
+      .message-header {
+        display: block;
+        margin-top: 1em;
+        margin-bottom: 0.5em;
+        cursor: pointer;
+        font-size: smaller;
+        clear: both;
+      }
+
+      .message-text {
+        font-size: smaller;
+        overflow-x: auto;
+      }
+
+      .message-header-date {
+        float: right;
+      }
+
+      .message-text-header {
+        display: block;
+        unicode-bidi: embed;
+        font-family: monospace;
+        white-space: pre;
+        margin-bottom: 1em;
+      }
+
+      .message-text-body {
+        display: block;
+        unicode-bidi: embed;
+        font-family: monospace;
+        white-space: pre;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="help">
+      <p>
+        This project is an experiment in using JSON as a data archive format,
+        with HTML and Javascript as a method of rich front-end visualization.
+        What you're seeing, here, is a dynamic HTML document backed by this 
+        <a href="messages.json">JSON repository</a> of Usenet message threads I've
+        archived from Google groups.
+      </p>
+
+      <p>
+        The original version of this visualizer made use of jQuery, but in an
+        effort to make this fully self-contained, I've rewritten it to use
+        pure Javascript.  It does assume a very modern browser, though, so
+        if you're using IE9 or earlier, it probably won't work for you.
+      </p>
+
+      <p>
+        Usage is pretty simple.  Threads are sorted first by date, then grouped
+        by newsgroup.  This gives a time-series presentation of the posts but
+        collapses multiple threads together for easier navigation.
+
+        Within each newgroup is a set of threads.
+
+        Click/tap on the newsgroup heading to open/close it.  Do the same for
+        thread headings inside the group to see the individual messages.
+        Clicking/tapping on the username for each message will toggle
+        presentation of the Usenet message header.
+      </p>
+    </div>
+
+    <div class="loading">Loading... <span class="loading-percent">0</span>%</div>
+
+    <script>
+        function createElement(tag, classes, content) {
+          let element = document.createElement(tag);
+
+          if (classes !== undefined) {
+            for (let c of classes) {
+              element.classList.add(c);
+            }
+          }
+
+          if (content !== undefined) {
+            element.textContent = content;
+          }
+
+          return element;
+        }
+
+        function fadeToggle(el) {
+          let start, tick, shouldStop, end;
+
+          if (el.style.display === "none") {
+            start = () => { el.style.display = ""; el.style.opacity = 0 };
+            tick = () => el.style.opacity = +el.style.opacity + 0.05;
+            shouldStop = () => el.style.opacity >= 1;
+            end = () => el.style.opacity = 1;
+          } else {
+            start = () => el.style.opacity = 1;
+            tick = () => el.style.opacity = +el.style.opacity - 0.05;
+            shouldStop = () => el.style.opacity <= 0;
+            end = () => { el.style.display = "none"; el.style.opacity = 0 };
+          }
+
+          let fadeLoop = function() {
+            tick();
+
+            if (! shouldStop()) {
+              window.requestAnimationFrame(fadeLoop);
+            } else {
+              end();
+            }
+          };
+
+          start();
+          fadeLoop();
+        }
+
+        function gogogo(data) {
+          /* 
+            Here I'm performing three operations on the data to prepare it.
+
+            First, I'm convering the dates to YYYY-MM-DD format.
+
+            Second, I'm sorting the threads by date lexicographically.
+
+            Third, I'm lifting the date of the first message up to define
+            the date of the thread.
+
+            Finally, I'm sorting the threads by date.
+
+            This really should've been done when the original archive was built,
+            but I'm too lazy to fix it now so we do it dynamically.
+
+            Note:  This is subtly broken.  The date sorting of messages in
+            the threads doesn't take time into account, so messages on the
+            same date may be out of order.  I'm too lazy to fix this.
+          */
+
+          for (let t of data.threads) {
+            for (let m of t.messages) {
+              let [day, month, year] = m.date.split("/");
+
+              m.date = year + "-" + month + "-" + day;
+            }
+
+            t.messages.sort((a, b) => a.date.localeCompare(b.date));
+
+            t.date = t.messages[0].date;
+          }
+
+          data.threads.sort((a, b) => a.date.localeCompare(b.date));
+
+          /*
+            We make use of a Javascript generator function to populate the
+            page while yielding timeslices to the browser periodically.
+
+            Obviously this only works on a fairly modern browser, which 
+            definitely means not IE.  Fortunately, I don't care.
+          */
+          var processMessages = (function*() {
+            // Get the percentage indicator so we can update it.
+            let percent = document.querySelector(".loading-percent");
+
+            // This is the container where our newsgroup divs will land.  We'll
+            // build this up and then present it all at once at the end.
+            let list = createElement("div", [ "messages" ]);
+            let count = 0;
+
+            // We use these variables to track the current group as part of group
+            // coalescing.
+            var groupName = undefined;
+            var groupDiv = undefined;
+
+            for (let thread of data.threads) {
+              /*
+                Here we do the coalescing of runs of threads in the same
+                newsgroup.  We check if the current thread newsgroup name
+                is different from the newsgroup name we know about, and if
+                it's not, we assume we've moved to a new group and construct
+                a new thread container accordingly.
+              */
+              if ((groupName === undefined) || (groupName !== thread.group)) {
+                let headerDiv = createElement("div", [ "group-header" ]);
+                                       
+                headerDiv.appendChild(createElement("span", [ "group-name" ], thread.group));
+                headerDiv.appendChild(createElement("span", [ "group-date" ], thread.date));
+
+                groupName = thread.group;
+                groupDiv = createElement("div", [ "group" ]);
+
+                groupDiv.appendChild(headerDiv);
+
+                list.appendChild(groupDiv);
+              }
+
+              /*
+                Now set up the thread-level headings and message container.
+              */
+              let threadDiv = createElement("div", [ "thread" ]);
+              let headerDiv = createElement("div", [ "thread-header" ]);
+              let messagesDiv = createElement("div", [ "thread-messages" ]);
+
+              headerDiv.appendChild(createElement("span", [ "thread-name" ], thread.subject));
+              headerDiv.appendChild(createElement("span", [ "thread-date" ], thread.date));
+
+              threadDiv.appendChild(headerDiv);
+              threadDiv.appendChild(messagesDiv);
+
+              groupDiv.appendChild(threadDiv);
+
+              /*
+                Then dump out the messages.
+              */
+              for (let message of thread.messages) {
+                let messageDiv = createElement("div", [ "message" ]);
+                let messageHeaderDiv = createElement("div", [ "message-header" ]);
+                let messageBodyDiv = createElement("div", [ "message-text" ]);
+
+                let [textHeader, textBody] = message.text.split("\r\n\r\n", 2);
+
+                messageHeaderDiv.appendChild(createElement("span", [ "message-header-username" ], message.username));
+                messageHeaderDiv.appendChild(createElement("span", [ "message-header-date" ], message.date));
+                
+                messageBodyDiv.appendChild(createElement("div", [ "message-text-header" ], textHeader));
+                messageBodyDiv.appendChild(createElement("div", [ "message-text-body" ], textBody));
+
+                messageDiv.appendChild(messageHeaderDiv);
+                messageDiv.appendChild(messageBodyDiv);
+
+                // Highlight my messages!
+                if (message.username.toLowerCase().includes("kosinski")) {
+                  messageDiv.classList.add("me");
+                }
+
+                messagesDiv.appendChild(messageDiv);
+
+                count++;
+
+                /*
+                  And here we yield periodically.  I've picked once every 100 
+                  messages purely by manually balancing reponsiveness with runtime
+                  (if we yield too often, it's really slow, but if we don't yield
+                  often enough then there's no feedback).
+                */
+                if ((count % 100) == 0) {
+                  percent.textContent = Math.round(count / data.count * 100);
+
+                  yield;
+                }
+              }
+            }
+
+            /*
+              Do final setup by hiding the threads and messages and hooking up
+              our even handlers.
+            */
+
+            list.querySelectorAll(".thread").forEach((el) => el.style.display = "none");
+            list.querySelectorAll(".thread-messages").forEach((el) => el.style.display = "none");
+            list.querySelectorAll(".message-text-header").forEach((el) => el.style.display = "none");
+
+            list.querySelectorAll(".group-header").forEach((el) => el.addEventListener("click", () => {
+              el.parentNode.querySelectorAll(".thread").forEach((el) => fadeToggle(el));
+            }));
+
+            list.querySelectorAll(".thread-header").forEach((el) => el.addEventListener("click", () => {
+              el.parentNode.querySelectorAll(".thread-messages").forEach((el) => fadeToggle(el));
+            }));
+
+            list.querySelectorAll(".message-header").forEach((el) => el.addEventListener("click", () => {
+              el.parentNode.querySelectorAll(".message-text-header").forEach((el) => fadeToggle(el));
+            }));
+
+            document.querySelector(".loading").style.display = "none";
+
+            document.body.appendChild(list);
+
+            return;
+          })();
+
+          /*
+            And finally we instantiate our generator and call it inside of
+            a recursive timer in order to yield to the browser periodically.
+          */
+          (function populate() {
+            if (! processMessages.next().done) {
+              setTimeout(populate, 0);
+            }
+          })();
+        }
+
+        var request = new XMLHttpRequest();
+
+        request.open("GET", "messages.json", true);
+
+        request.onload = function() {
+          if (request.status >= 200 && request.status < 400) {
+            gogogo(JSON.parse(request.responseText));
+          } else {
+          }
+        };
+
+        request.send();
+    </script>
+  </body>
+</html>
